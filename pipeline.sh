@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pipeline.sh — Download a year of NOAA Storm Events, convert to GeoParquet.
+# pipeline.sh — Download Martin County wells on demand, convert to GeoParquet.
 #
 # Usage:   ./pipeline.sh [YEAR]
 # Example: ./pipeline.sh 2024
@@ -16,22 +16,29 @@ set -euo pipefail
 # Config
 # -----------------------------------------------------------------------------
 
-# Year to pull. Override by passing as the first argument.
-YEAR="${1:-2024}"
+# The base directory where RRC stores the county-specific well shapefiles
+BASE_URL="https://mft.rrc.texas.gov/link/d551fb20-442e-4b67-84fa-ac3f23ecabb4#"
 
-# NOAA file naming pattern. The "c{CREATED_DATE}" portion changes when NOAA
-# republishes a year. Look at https://www.ncei.noaa.gov/data/storm-events/files/
-# and update CREATED_DATE for the year you want.
-CREATED_DATE="20250101"
+# The specific file for Martin County (317)
+FILE_NAME="well317.zip"
 
-BASE_URL="https://www.ncei.noaa.gov/data/storm-events/files"
-FILE_NAME="StormEvents_details-ftp_v1.0_d${YEAR}_c${CREATED_DATE}.csv.gz"
+# The full download URL
 URL="${BASE_URL}/${FILE_NAME}"
 
+#!/bin/bash
+
 RAW_DIR="data/raw"
+FILE_PATH="${RAW_DIR}/${FILE_NAME}"
+
+# Ensure destination directory exists
+mkdir -p "$RAW_DIR"
+
+# Example usage:
+# curl -O "${URL}"
+
 PROCESSED_DIR="data/processed"
-RAW_GZ="${RAW_DIR}/${FILE_NAME}"
-RAW_CSV="${RAW_DIR}/${FILE_NAME%.gz}"
+RAW_SHP="${RAW_DIR}/${FILE_NAME}"
+RAW_ZIP="${RAW_DIR}/${FILE_NAME%.zip}"
 OUT_PARQUET="${PROCESSED_DIR}/storms_${YEAR}.parquet"
 
 # -----------------------------------------------------------------------------
@@ -54,6 +61,23 @@ echo "[2/4] Downloading ${FILE_NAME}"
 #
 # Skip the download if the file already exists (idempotency).
 
+# Idempotency check: Skip if file already exists
+if [ -f "$FILE_PATH" ]; then
+    echo "File '${FILE_NAME}' already exists locally. Skipping download."
+else
+    # -L: Follow redirects
+    # --fail: Exit non-zero on HTTP errors (e.g., 404)
+    # -o: Save to path
+    curl -L --fail -o "$FILE_PATH" "$URL"
+    
+    if [ $? -eq 0 ]; then
+        echo "Successfully downloaded ${FILE_NAME}."
+    else
+        echo "Error: Failed to download. The link may have expired."
+        exit 1
+    fi
+fi
+
 # -----------------------------------------------------------------------------
 # Step 3: Decompress
 # -----------------------------------------------------------------------------
@@ -63,6 +87,28 @@ echo "[3/4] Decompressing"
 # The -k flag keeps the original .gz so the pipeline can rerun.
 # Skip this step if RAW_CSV already exists.
 
+#!/usr/bin/env zsh
+
+# Derive paths from FILE_PATH
+RAW_ZIP="${FILE_PATH}"
+RAW_SHP="${FILE_PATH%.zip}.shp"
+OUT_DIR="${FILE_PATH:h}"
+
+# Skip if .shp already exists
+if [[ -f "$RAW_SHP" ]]; then
+  echo "Skipping: RAW_SHP already exists at '$RAW_SHP'"
+else
+  echo "Unzipping '$RAW_ZIP' → '$OUT_DIR'"
+  unzip -k "$RAW_ZIP" -d "$OUT_DIR"
+
+  # Confirm the .shp was produced
+  if [[ -f "$RAW_SHP" ]]; then
+    echo "Done: '$RAW_SHP' created"
+  else
+    echo "Error: unzip ran but '$RAW_SHP' not found — check the zip contents" >&2
+    exit 1
+  fi
+fi
 # -----------------------------------------------------------------------------
 # Step 4: Convert CSV to GeoParquet
 # -----------------------------------------------------------------------------

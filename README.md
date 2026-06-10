@@ -12,7 +12,8 @@ Total runtime: about 90 seconds on a typical home internet connection.
 
 - **Source:** Railroad Commission of Texas (RRC) Well Records
 - **License:** Public domain (State data)
-- **What's in it:** All recorded oil and gas well data for Martin County, including well location (API), status, depth, and operator information.
+- **What's in it:** All recorded oil and gas well data for Martin County (FIPS 317), including well location (API), status, depth, and operator information.
+- **Data Link:** https://mft.rrc.texas.gov/link/d551fb20-442e-4b67-84fa-ac3f23ecabb4#
 
 ## How to run it
 
