@@ -1,54 +1,110 @@
 #!/usr/bin/env zsh
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-FILE_NAME="${FILE_NAME:-Basemap317.shp}"
-RAW_DIR="data/raw/Basemap317/shp"
+RAW_DIR="data/raw"
 PROCESSED_DIR="data/processed"
-FILE_PATH="${RAW_DIR}/${FILE_NAME}"
+DATASET_ID="g3ex-37ca"
+BASE_URL="https://data.texas.gov/resource/${DATASET_ID}.geojson"
+GEOJSON_PATH="${RAW_DIR}/landSurveyWest.geojson"
 PARQUET_PATH="${PROCESSED_DIR}/martinBasemap.parquet"
+BATCH_SIZE=50000   # rows per request — well above typical dataset size
 
 # ── Step 1: Set up directories ─────────────────────────────────────────────────
-echo "[1/5] Setting up directories"
+echo "[1/3] Setting up directories"
 mkdir -p "$RAW_DIR" "$PROCESSED_DIR"
 
-# ── Step 2: Download the raw file ──────────────────────────────────────────────
-echo "[2/5] Downloading ${FILE_NAME}"
+# ── Step 2: Download GeoJSON from Texas Open Data Portal (Socrata SODA API) ────
+# The /resource/ endpoint caps at 1000 rows by default.
+# $limit and $offset handle pagination; $order=:id ensures stable page order.
+echo "[2/3] Downloading land survey polygons (GeoJSON)"
 
-if [[ -f "$FILE_PATH" ]]; then
-  echo " File '${FILE_NAME}' already exists locally. Skipping download."
+if [[ -f "$GEOJSON_PATH" ]]; then
+  echo "  Skipping: '${GEOJSON_PATH}' already exists."
 else
-  python landBasemap.py
+  # Fetch row count first so we know if pagination is needed
+  ROW_COUNT=$(curl -sL --fail \
+    "https://data.texas.gov/resource/${DATASET_ID}.json?\$select=count(*)&\$limit=1" \
+    | grep -o '"count_":[0-9]*' | grep -o '[0-9]*')
 
-  if [[ -f "$FILE_PATH" ]]; then
-    echo "Successfully downloaded ${FILE_NAME}."
+  echo "  Dataset has ${ROW_COUNT} rows. Fetching in pages of ${BATCH_SIZE}..."
+
+  # Write opening FeatureCollection bracket
+  echo '{"type":"FeatureCollection","features":[' > "$GEOJSON_PATH"
+
+  OFFSET=0
+  FIRST_BATCH=true
+
+  while true; do
+    BATCH_FILE=$(mktemp /tmp/rrc_batch_XXXXXX.geojson)
+
+    curl -sL --fail \
+      "${BASE_URL}?\$limit=${BATCH_SIZE}&\$offset=${OFFSET}&\$order=:id" \
+      -o "$BATCH_FILE"
+
+    # Extract just the features array contents (strip outer FeatureCollection wrapper)
+    FEATURES=$(python3 -c "
+import json, sys
+with open('${BATCH_FILE}') as f:
+    fc = json.load(f)
+features = fc.get('features', [])
+if features:
+    print(json.dumps(features)[1:-1])  # strip [ and ]
+" 2>/dev/null)
+
+    rm -f "$BATCH_FILE"
+
+    if [[ -z "$FEATURES" ]]; then
+      break  # no more rows
+    fi
+
+    # Add comma separator between batches
+    if [[ "$FIRST_BATCH" == "true" ]]; then
+      echo "$FEATURES" >> "$GEOJSON_PATH"
+      FIRST_BATCH=false
+    else
+      echo ",$FEATURES" >> "$GEOJSON_PATH"
+    fi
+
+    OFFSET=$(( OFFSET + BATCH_SIZE ))
+
+    # Stop if we've fetched all rows
+    if (( OFFSET >= ROW_COUNT )); then
+      break
+    fi
+  done
+
+  # Close the FeatureCollection
+  echo ']}' >> "$GEOJSON_PATH"
+
+  if [[ -f "$GEOJSON_PATH" ]]; then
+    echo "  Successfully downloaded '${GEOJSON_PATH}'."
   else
-    echo "Error: '${FILE_PATH}' was not created." >&2
+    echo "  Error: Download failed." >&2
     exit 1
   fi
 fi
 
-#---Step 3: Convert shapefile to parquet ──────────────────────────────────────────
-#Check if files exist and then convert shapefile to parquet with ogr2ogr, reprojecting to WGS 84 (EPSG:4326)
+# ── Step 3: Convert GeoJSON → GeoParquet ───────────────────────────────────────
+echo "[3/3] Converting to GeoParquet"
+
 if [[ -f "$PARQUET_PATH" ]]; then
-  echo "Skipping: '${PARQUET_PATH}' already exists"
+  echo "  Skipping: '${PARQUET_PATH}' already exists."
 else
- 
-  if [[ -z "$FILE_PATH" ]]; then
-    echo "Error: No *s.shp found in '${RAW_DIR}'" >&2
-    echo "  Available files:" >&2
-    ls "$RAW_DIR" >&2
-    exit 1
-  fi
- 
-  echo "  Source: '${FILE_PATH}'"
- 
-  #Convert shapefile to parquet with ogr2ogr, reprojecting to WGS 84 (EPSG:4326)
-  ogr2ogr -f "Parquet" "${PARQUET_PATH}" "${FILE_PATH}" -t_srs EPSG:4326
- 
+  # Socrata GeoJSON is already in WGS84 (EPSG:4326) — no reprojection needed
+  ogr2ogr \
+    -f Parquet \
+    "$PARQUET_PATH" \
+    "$GEOJSON_PATH"
+
   if [[ -f "$PARQUET_PATH" ]]; then
-    echo "Done: '${PARQUET_PATH}' created"
+    echo "  Done: '${PARQUET_PATH}' created."
   else
-    echo "Error: ogr2ogr ran but '${PARQUET_PATH}' was not created" >&2
+    echo "  Error: ogr2ogr ran but '${PARQUET_PATH}' was not created." >&2
     exit 1
   fi
 fi
+
+echo ""
+echo "Pipeline complete."
+echo "  GeoJSON   : ${GEOJSON_PATH}"
+echo "  GeoParquet: ${PARQUET_PATH}"
