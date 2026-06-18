@@ -1,15 +1,45 @@
+#!/usr/bin/env python3
+"""
+drillingPermits.py
+==================
+Downloads the most recent monthly drilling permit master file from the
+Texas RRC GoAnywhere MFT portal using a headless browser (Playwright).
+
+File pattern: daf420.dat.mm-dd-yyyy (e.g. daf420.dat.05-31-2026)
+Multiple monthly files may be listed — always downloads the most recent.
+The portal wraps the file in a ZIP — this script extracts it and deletes
+the ZIP, leaving the dated .dat file on disk.
+
+The resolved filename is written to data/raw/.last_daf420 so the shell
+pipeline can reference it dynamically.
+"""
+
 import asyncio
+import re
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-LINK_URL  = "https://mft.rrc.texas.gov/link/5f07cc72-2e79-4df8-ade1-9aeb792e03fc"
-FILE_NAME = "daf420.dat"
-OUT_DIR   = Path("data/raw")
-OUT_PATH  = OUT_DIR / FILE_NAME
-ZIP_PATH  = OUT_DIR / "daf420.zip"   # portal delivers a zip; extracted to OUT_PATH
+LINK_URL    = "https://mft.rrc.texas.gov/link/f5dfea9c-bb39-4a5e-a44e-fb522e088cba"
+FILE_PATTERN = re.compile(r"daf420\.dat\.(\d{2}-\d{2}-\d{4})")
+OUT_DIR     = Path("data/raw")
+MARKER_PATH = OUT_DIR / ".last_daf420"
+
+
+def parse_file_date(filename: str) -> datetime:
+    """Parse the mm-dd-yyyy suffix from the filename into a datetime.
+    mm-dd-yyyy is NOT lexicographically sortable, so we parse properly.
+    """
+    m = FILE_PATTERN.search(filename)
+    if not m:
+        raise ValueError(f"Cannot parse date from filename: {filename}")
+    return datetime.strptime(m.group(1), "%m-%d-%Y")
+
 
 async def download():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(accept_downloads=True)
@@ -23,40 +53,82 @@ async def download():
         except PWTimeout:
             print("  Warning: page did not fully settle — continuing anyway")
 
-        # Locate the daf420.dat row
-        row = page.locator(f"tr:has-text('{FILE_NAME}')").first
+        # ── Scan rows for all matching monthly files ─────────────────────
+        rows = page.locator("tbody tr")
+        count = await rows.count()
+
+        matches = []
+        for i in range(count):
+            text = await rows.nth(i).text_content()
+            if not text:
+                continue
+            m = FILE_PATTERN.search(text)
+            if m:
+                matches.append((m.group(), i))
+
+        if not matches:
+            raise RuntimeError(
+                "No daf420.dat.mm-dd-yyyy files found on the portal page."
+            )
+
+        # Sort descending by actual parsed date (NOT lexicographic)
+        matches.sort(key=lambda x: parse_file_date(x[0]), reverse=True)
+        most_recent_name, most_recent_idx = matches[0]
+        out_path = OUT_DIR / most_recent_name
+        zip_path = OUT_DIR / f"{most_recent_name}.zip"
+
+        print(f"  Files found on server  : {len(matches)}")
+        for name, _ in matches:
+            marker = " ← most recent" if name == most_recent_name else ""
+            print(f"    {name}{marker}")
+
+        # ── Idempotency: skip if already downloaded ──────────────────────
+        if out_path.exists():
+            print(f"  Already exists locally: '{most_recent_name}'. Skipping.")
+            MARKER_PATH.write_text(most_recent_name)
+            await browser.close()
+            return
+
+        # ── Select and download ──────────────────────────────────────────
+        row = rows.nth(most_recent_idx)
         await row.scroll_into_view_if_needed()
         await row.hover()
 
-        # Click the PrimeFaces visual checkbox wrapper
         checkbox = row.locator(".ui-chkbox-box").first
         await checkbox.wait_for(state="visible", timeout=10_000)
         await checkbox.click()
-        print(f"  Selected '{FILE_NAME}'")
+        print(f"  Selected '{most_recent_name}'")
 
-        # Click Download and capture the zip the portal delivers
         download_btn = page.locator("button", has_text="Download").first
-        async with page.expect_download(timeout=60_000) as dl_info:
+        async with page.expect_download(timeout=120_000) as dl_info:
             await download_btn.click()
 
         dl = await dl_info.value
-        await dl.save_as(ZIP_PATH)
-        print(f"  Saved portal zip to '{ZIP_PATH}'")
+        await dl.save_as(zip_path)
+        print(f"  Saved portal ZIP to '{zip_path}'")
         await browser.close()
 
-    # Extract the inner .dat file from the zip
-    print(f"  Extracting '{FILE_NAME}' from zip...")
-    with zipfile.ZipFile(ZIP_PATH, "r") as zf:
-        dat_files = [f for f in zf.namelist() if f.endswith(".dat")]
+    # ── Extract inner .dat file from ZIP ─────────────────────────────────
+    print(f"  Extracting '{most_recent_name}' from ZIP...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # Prefer a file matching the pattern; fall back to any non-zip entry
+        dat_files = [f for f in zf.namelist() if FILE_PATTERN.search(f)] \
+                 or [f for f in zf.namelist() if not f.endswith(".zip")]
         if not dat_files:
             raise RuntimeError(
-                f"No .dat file found inside zip. Contents: {zf.namelist()}"
+                f"No .dat file found inside ZIP. Contents: {zf.namelist()}"
             )
         inner_name = dat_files[0]
-        with zf.open(inner_name) as src, open(OUT_PATH, "wb") as dst:
+        with zf.open(inner_name) as src, open(out_path, "wb") as dst:
             dst.write(src.read())
 
-    ZIP_PATH.unlink()   # remove the zip; OUT_PATH is the file the shell cares about
-    print(f"  Extracted to '{OUT_PATH}'")
+    zip_path.unlink()
+    print(f"  Extracted to '{out_path}'")
 
-asyncio.run(download())
+    # ── Write marker for shell script ────────────────────────────────────
+    MARKER_PATH.write_text(most_recent_name)
+    print(f"  Wrote marker: '{MARKER_PATH}' → '{most_recent_name}'")
+
+
+if __name__ == "__main__":
+    asyncio.run(download())
