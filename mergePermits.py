@@ -72,6 +72,17 @@ def main():
         # Concat new month first so ties in dedup go to the newest data
         combined = pd.concat([new_gdf, existing_gdf], ignore_index=True)
 
+        # Warn about records with missing permit_number before deduplication
+        null_pn = combined["permit_number"].isna() | (
+            combined["permit_number"].astype(str).str.strip() == ""
+        )
+        if null_pn.any():
+            print(
+                f"  Warning: {null_pn.sum():,} records with missing permit_number "
+                f"— these will not be deduplicated correctly",
+                file=sys.stderr,
+            )
+
         # Flag geometry: non-null and non-empty
         combined["_has_geom"] = (
             combined.geometry.notna() & ~combined.geometry.is_empty

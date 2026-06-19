@@ -1,0 +1,8 @@
+# Core geospatial stack
+geopandas>=0.14
+pandas>=2.0
+pyarrow>=14.0
+
+# Browser automation for RRC portal downloads
+playwright>=1.40
+# After pip install: run `playwright install chromium`

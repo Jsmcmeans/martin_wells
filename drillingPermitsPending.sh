@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 RAW_DIR="data/raw"
@@ -35,24 +36,32 @@ if [[ ! -f "$FILE_PATH" ]]; then
 fi
 echo "  Active permit file: '${FILE_PATH}'"
 
-# Verify companion files exist
-WELLBORE_FILE=$(ls -1 "${RAW_DIR}"/dp_wellbore_pending_*.txt 2>/dev/null | tail -1)
-LATLONG_FILE=$(ls -1 "${RAW_DIR}"/dp_latlongs_pending_*.txt 2>/dev/null | tail -1)
-
-if [[ -z "$WELLBORE_FILE" ]]; then
+# Verify companion files exist using zsh glob arrays (avoids ls parsing antipattern)
+WELLBORE_FILES=("${RAW_DIR}"/dp_wellbore_pending_*.txt(N))
+if [[ ${#WELLBORE_FILES[@]} -eq 0 ]]; then
     echo "  Error: No dp_wellbore_pending_*.txt found in '${RAW_DIR}'" >&2
     exit 1
 fi
+WELLBORE_FILE="${WELLBORE_FILES[-1]}"
 echo "  Active wellbore file: '${WELLBORE_FILE}'"
 
-if [[ -z "$LATLONG_FILE" ]]; then
-    echo "  Error: No dp_latlongs_pending_*.txt found in '${RAW_DIR}'" >&2
+# Handles both dp_latlong_pending_* and dp_latlongs_pending_* naming
+LATLONG_FILES=("${RAW_DIR}"/dp_latlong{,s}_pending_*.txt(N))
+if [[ ${#LATLONG_FILES[@]} -eq 0 ]]; then
+    echo "  Error: No dp_latlong(s)_pending_*.txt found in '${RAW_DIR}'" >&2
     exit 1
 fi
+LATLONG_FILE="${LATLONG_FILES[-1]}"
 echo "  Active latlong file : '${LATLONG_FILE}'"
 
 # ── Step 3: Parse delimited data to GeoJSON ────────────────────────────────────
 echo "[3/5] Parsing pending permit files → GeoJSON"
+
+# Invalidate outputs if the permit source file is newer than existing GeoJSON
+if [[ -f "$GEOJSON_PATH" ]] && [[ "$FILE_PATH" -nt "$GEOJSON_PATH" ]]; then
+    echo "  Source file is newer — removing stale GeoJSON and Parquet"
+    rm -f "$GEOJSON_PATH" "$PARQUET_PATH"
+fi
 
 if [[ -f "$GEOJSON_PATH" ]]; then
     echo "  Skipping: '${GEOJSON_PATH}' already exists."

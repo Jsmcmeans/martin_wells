@@ -11,29 +11,25 @@ the Texas RRC GoAnywhere MFT portal using a headless browser (Playwright).
   data/raw/.backfill_manifest so the shell pipeline processes them in
   the correct chronological order for merging
 
-Run via backfill_permits.sh — not intended for standalone use.
+Run via backfillPermits.sh — not intended for standalone use.
 """
 
 import asyncio
-import re
-import zipfile
-from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-LINK_URL     = "https://mft.rrc.texas.gov/link/f5dfea9c-bb39-4a5e-a44e-fb522e088cba"
-FILE_PATTERN = re.compile(r"daf420\.dat\.(\d{2}-\d{2}-\d{4})")
-OUT_DIR      = Path("data/raw")
-MONTHS       = 12
-MANIFEST_PATH  = OUT_DIR / ".backfill_manifest"
-FAILURES_PATH  = OUT_DIR / ".backfill_failures"
+from rrc_utils import (
+    LINK_URL_DAF420,
+    FILE_PATTERN_DAF420,
+    DOWNLOAD_TIMEOUT_MS,
+    parse_file_date,
+    extract_dat_from_zip,
+)
 
-
-def parse_file_date(filename: str) -> datetime:
-    m = FILE_PATTERN.search(filename)
-    if not m:
-        raise ValueError(f"Cannot parse date from: {filename}")
-    return datetime.strptime(m.group(1), "%m-%d-%Y")
+OUT_DIR       = Path("data/raw")
+MONTHS        = 12
+MANIFEST_PATH = OUT_DIR / ".backfill_manifest"
+FAILURES_PATH = OUT_DIR / ".backfill_failures"
 
 
 async def download_one(page, filename: str, row_idx: int) -> bool:
@@ -56,22 +52,13 @@ async def download_one(page, filename: str, row_idx: int) -> bool:
         await checkbox.click()
 
         download_btn = page.locator("button", has_text="Download").first
-        async with page.expect_download(timeout=180_000) as dl_info:
+        async with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
             await download_btn.click()
 
         dl = await dl_info.value
         await dl.save_as(zip_path)
 
-        # Extract inner .dat file
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            dat_files = [f for f in zf.namelist() if FILE_PATTERN.search(f)] \
-                     or [f for f in zf.namelist() if not f.endswith(".zip")]
-            if not dat_files:
-                raise RuntimeError(f"No .dat file inside ZIP. Contents: {zf.namelist()}")
-            with zf.open(dat_files[0]) as src, open(out_path, "wb") as dst:
-                dst.write(src.read())
-
-        zip_path.unlink()
+        extract_dat_from_zip(zip_path, out_path)
         print(f"    Extracted → '{out_path.name}'")
 
         # Uncheck so next file can be selected cleanly
@@ -108,7 +95,7 @@ async def backfill():
         page    = await context.new_page()
 
         print("  Opening RRC GoDrive page...")
-        await page.goto(LINK_URL)
+        await page.goto(LINK_URL_DAF420)
 
         try:
             await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -124,7 +111,7 @@ async def backfill():
             text = await rows.nth(i).text_content()
             if not text:
                 continue
-            m = FILE_PATTERN.search(text)
+            m = FILE_PATTERN_DAF420.search(text)
             if m:
                 matches.append((m.group(), i))
 

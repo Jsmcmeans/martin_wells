@@ -15,26 +15,19 @@ pipeline can reference it dynamically.
 """
 
 import asyncio
-import re
-import zipfile
-from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-LINK_URL    = "https://mft.rrc.texas.gov/link/f5dfea9c-bb39-4a5e-a44e-fb522e088cba"
-FILE_PATTERN = re.compile(r"daf420\.dat\.(\d{2}-\d{2}-\d{4})")
+from rrc_utils import (
+    LINK_URL_DAF420,
+    FILE_PATTERN_DAF420,
+    DOWNLOAD_TIMEOUT_MS,
+    parse_file_date,
+    extract_dat_from_zip,
+)
+
 OUT_DIR     = Path("data/raw")
 MARKER_PATH = OUT_DIR / ".last_daf420"
-
-
-def parse_file_date(filename: str) -> datetime:
-    """Parse the mm-dd-yyyy suffix from the filename into a datetime.
-    mm-dd-yyyy is NOT lexicographically sortable, so we parse properly.
-    """
-    m = FILE_PATTERN.search(filename)
-    if not m:
-        raise ValueError(f"Cannot parse date from filename: {filename}")
-    return datetime.strptime(m.group(1), "%m-%d-%Y")
 
 
 async def download():
@@ -46,7 +39,7 @@ async def download():
         page    = await context.new_page()
 
         print("  Opening RRC GoDrive page...")
-        await page.goto(LINK_URL)
+        await page.goto(LINK_URL_DAF420)
 
         try:
             await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -62,7 +55,7 @@ async def download():
             text = await rows.nth(i).text_content()
             if not text:
                 continue
-            m = FILE_PATTERN.search(text)
+            m = FILE_PATTERN_DAF420.search(text)
             if m:
                 matches.append((m.group(), i))
 
@@ -100,7 +93,7 @@ async def download():
         print(f"  Selected '{most_recent_name}'")
 
         download_btn = page.locator("button", has_text="Download").first
-        async with page.expect_download(timeout=120_000) as dl_info:
+        async with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
             await download_btn.click()
 
         dl = await dl_info.value
@@ -110,19 +103,7 @@ async def download():
 
     # ── Extract inner .dat file from ZIP ─────────────────────────────────
     print(f"  Extracting '{most_recent_name}' from ZIP...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        # Prefer a file matching the pattern; fall back to any non-zip entry
-        dat_files = [f for f in zf.namelist() if FILE_PATTERN.search(f)] \
-                 or [f for f in zf.namelist() if not f.endswith(".zip")]
-        if not dat_files:
-            raise RuntimeError(
-                f"No .dat file found inside ZIP. Contents: {zf.namelist()}"
-            )
-        inner_name = dat_files[0]
-        with zf.open(inner_name) as src, open(out_path, "wb") as dst:
-            dst.write(src.read())
-
-    zip_path.unlink()
+    extract_dat_from_zip(zip_path, out_path)
     print(f"  Extracted to '{out_path}'")
 
     # ── Write marker for shell script ────────────────────────────────────

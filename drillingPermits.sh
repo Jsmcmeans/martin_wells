@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 RAW_DIR="data/raw"
@@ -91,6 +92,9 @@ else
   echo "  Error: mergePermits.py ran but '${ACCUMULATED_PARQUET}' was not created." >&2
   exit 1
 fi
+
+rm -f "$CURRENT_PARQUET"
+echo "  Cleaned up intermediate: '${CURRENT_PARQUET}'"
 
 # ── Step 6: Summary ────────────────────────────────────────────────────────────
 echo "[6/6] Pipeline complete"
