@@ -77,13 +77,54 @@ def strip_field(record: str, start: int, length: int) -> str:
 
 
 def parse_date(raw: str) -> str | None:
-    """Convert CCYYMMDD → ISO 8601 date string, or None if blank/zeros."""
+    """Convert RRC date field → ISO 8601 string, or None if blank/zeros.
+
+    The daf420 master file uses two date formats across different record
+    generations and fields:
+
+    CCYYMMDD  (expected) — 4-digit year, then 2-digit month and day.
+                           e.g. '20260528' → '2026-05-28'
+
+    YYMMDD??  (actual, newer records) — 2-digit year, 2-digit month,
+                           2-digit day, then 2 trailing padding chars
+                           (always '00'). parse_permits.py previously
+                           mis-sliced these as CCYYMMDD, producing
+                           corrupt strings like '2605-28-00'.
+                           e.g. '26052800' → '2026-05-28'
+
+    Strategy:
+      1. Try CCYYMMDD: validate month [1-12] and day [1-31].
+         Valid → return immediately.
+      2. Fallback YYMMDD??: re-slice, validate month and day.
+         Valid → prepend century using Y2K window (YY > 50 → 19xx,
+         YY <= 50 → 20xx) and return.
+      3. Neither valid → return None (bad data).
+    """
     raw = raw.strip()
     if not raw or raw == "0" * len(raw):
         return None
-    if len(raw) == 8:
-        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
-    return raw
+    if len(raw) != 8:
+        return raw  # unexpected length — pass through unchanged
+
+    # ── Try CCYYMMDD first ────────────────────────────────────────────────
+    y4, mm, dd = raw[0:4], raw[4:6], raw[6:8]
+    try:
+        if 1 <= int(mm) <= 12 and 1 <= int(dd) <= 31:
+            return f"{y4}-{mm}-{dd}"
+    except ValueError:
+        pass
+
+    # ── Fallback: YYMMDD?? ────────────────────────────────────────────────
+    yy, mm2, dd2 = raw[0:2], raw[2:4], raw[4:6]
+    try:
+        y2, month2, day2 = int(yy), int(mm2), int(dd2)
+        if 1 <= month2 <= 12 and 1 <= day2 <= 31:
+            century = "19" if y2 > 50 else "20"
+            return f"{century}{yy}-{mm2}-{dd2}"
+    except ValueError:
+        pass
+
+    return None
 
 
 def safe_int(raw: str):

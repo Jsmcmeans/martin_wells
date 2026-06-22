@@ -3,6 +3,9 @@ geopandas>=0.14
 pandas>=2.0
 pyarrow>=14.0
 
+# H3 hex binning — used by deriveSignals.py for the hotspot layer
+h3>=4.0
+
 # Browser automation for RRC portal downloads
 playwright>=1.40
 # After pip install: run `playwright install chromium`
