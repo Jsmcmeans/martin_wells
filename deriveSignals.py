@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import warnings
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 # Quiet a handful of harmless GeoPandas/Shapely deprecation chatter
 warnings.filterwarnings("ignore", category=UserWarning, module="geopandas")
@@ -82,22 +84,25 @@ def _today():
 def _parse_dates(s):
     """Parse to datetime, with auto-repair for malformed RRC source format.
 
-    Two known data-quality issues are handled here:
+    Handles two data-quality issues produced by the daf420 format mismatch:
 
-    1. Format shift in parse_permits.py. The upstream parser slices each
-       8-char raw date as CCYYMMDD ('20260528' → '2026-05-28'), but the
-       RRC daf420 master file actually emits some date fields as YYMMDD??
-       ('26052800' = YY=26, MM=05, DD=28, then two trailing junk chars).
-       parse_permits.py mis-slices these into 'YYYY-DD-00' where the YYYY
-       is really (YY year + MM month) glued together. Detect and reconstruct:
-           '2605-28-00' → '2026-05-28'
-       Correctly-formatted CCYYMMDD records pass through unchanged.
+    1. YYMMDD?? mis-slicing. parse_permits.py assumed CCYYMMDD but many
+       records use YYMMDD?? (2-digit year + month + day + 2 trailing bytes
+       that vary: '00', '20', etc.). After parse_permits.py slices them as
+       4+2+2, the resulting ISO-shaped string has a wrong century:
+           '1406-01-20'  → repair → '2014-06-01'
+           '2504-11-20'  → repair → '2025-04-11'
+           '2605-28-00'  → repair → '2026-05-28'
+       Detection: valid ISO pattern (YYYY-MM-DD) with year outside [1900,2035].
+       Repair: strip dashes → 8 raw digits → YYMMDD re-slice → prepend century
+       via Y2K window (YY > 50 → 19xx, YY ≤ 50 → 20xx).
 
-       Long-term fix is upstream in parse_permits.py — see BUILD docs.
+    2. Genuine year typos (e.g. '2408-06-20'). After repair attempt, any
+       remaining out-of-range years are coerced to NaT.
 
-    2. Year typos (e.g. '2408-06-20' instead of '2024-06-20') overflow
-       pandas datetime[ns] resolution during arithmetic. Coerce out-of-range
-       years (outside [1900, 2100]) to NaT.
+    parse_permits.py now applies the same year-range guard at parse time,
+    so newly generated parquets will not contain these strings. This function
+    remains the downstream safety net for already-generated files.
     """
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
@@ -107,17 +112,32 @@ def _parse_dates(s):
     if s.dtype == object or pd.api.types.is_string_dtype(s):
         s_str = s.astype(str).str.strip()
 
-        # Repair (1): 'YYYY-DD-00' (where YYYY = YY+MM glued together) → 'YYYY-MM-DD'.
-        # Captures: (1)=YY year, (2)=MM month, (3)=DD day; prepend '20' century.
-        s_str = s_str.str.replace(
-            r"^(\d{2})(\d{2})-(\d{2})-00$",
-            r"20\1-\2-\3",
-            regex=True,
-        )
+        # Detect ISO-shaped strings with out-of-range years
+        iso_mask = s_str.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
+        if iso_mask.any():
+            years = pd.to_numeric(s_str.str.slice(0, 4), errors="coerce")
+            bad_year = iso_mask & (~years.between(1900, 2035, inclusive="both").fillna(False))
 
-        # Repair (2): year filter — anything outside [1900, 2100] is a typo
-        years = pd.to_numeric(s_str.str.slice(0, 4), errors="coerce")
-        in_range = years.between(1900, 2100, inclusive="both").fillna(False)
+            if bad_year.any():
+                # Strip dashes → 8-char raw digits → YYMMDD?? re-slice
+                raw8   = s_str[bad_year].str.replace("-", "", regex=False)
+                yy     = raw8.str[0:2]
+                mm2    = raw8.str[2:4]
+                dd2    = raw8.str[4:6]
+                yr2    = pd.to_numeric(yy,  errors="coerce")
+                month2 = pd.to_numeric(mm2, errors="coerce")
+                day2   = pd.to_numeric(dd2, errors="coerce")
+                valid  = (month2.between(1, 12) & day2.between(1, 31)).fillna(False)
+                century = yr2.apply(
+                    lambda y: "19" if pd.notna(y) and y > 50 else "20"
+                )
+                repaired = (century + yy + "-" + mm2 + "-" + dd2).where(valid, None)
+                s_str = s_str.copy()
+                s_str[bad_year] = repaired
+
+        # Nullify any remaining out-of-range years (genuine typos)
+        years2 = pd.to_numeric(s_str.str.slice(0, 4), errors="coerce")
+        in_range = years2.between(1900, 2035, inclusive="both").fillna(False)
         s = s_str.where(in_range, None)
 
     with warnings.catch_warnings():
@@ -161,18 +181,263 @@ def _normalize_api(series, width=8):
     return s
 
 
+def _coerce_mixed_objects(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Coerce object columns with mixed date/string values to plain strings.
+
+    When pd.concat() joins accumulated permits (Date-typed columns, read from
+    GeoParquet) with pending permits (string-typed columns from parse_pending),
+    some columns become object dtype containing a mix of Python date objects
+    and plain strings. PyArrow rejects these on write with:
+        'object of type <class str> cannot be converted to int'
+    because it sees the column as Date32 (stored as int32) but can't convert
+    the string values. Convert any such column to clean ISO-string values.
+    """
+    out = gdf.copy()
+    for col in out.columns:
+        if col == "geometry" or out[col].dtype != object:
+            continue
+        sample = out[col].dropna().head(20)
+        if sample.empty:
+            continue
+        # If any value is NOT already a string, the column is mixed-type
+        if any(not isinstance(v, str) for v in sample):
+            out[col] = out[col].apply(
+                lambda x: (
+                    x.isoformat() if hasattr(x, "isoformat")
+                    else (
+                        None if x is None or (isinstance(x, float) and pd.isna(x))
+                        else str(x) if str(x) not in ("NaT", "None", "nan", "NaN")
+                        else None
+                    )
+                )
+            )
+    return gpd.GeoDataFrame(out, geometry="geometry", crs=gdf.crs)
+
+
 def _filter_to_county(gdf, fips):
-    """Try every county-code column we know about, return first hit."""
+    """Try every county-code column we know about, return first hit.
+
+    The pending permits parquet stores county codes with embedded double-quote
+    characters (e.g. '"317"' instead of '317') because the source file format
+    has changed. Strip both whitespace and quotes before comparing.
+    Also adds 'district' as a fallback via the known Martin County district
+    codes (08 / 8A / 7C) in case no county-code column is populated.
+    """
     candidates = [
         "permit_county_code", "county_code", "onshore_county",
         "wb_county_code", "api_county_code",
     ]
     for col in candidates:
         if col in gdf.columns:
-            mask = gdf[col].astype(str).str.strip() == fips
+            # Strip whitespace AND embedded quote characters
+            cleaned = gdf[col].astype(str).str.strip().str.strip("\"'")
+            mask = cleaned == fips
             if mask.any():
                 return gdf[mask].copy(), col
+
+    # Fallback: filter by district code for Martin County (District 08)
+    if "district" in gdf.columns:
+        mask = gdf["district"].astype(str).str.strip().isin(["08", "8", "010", "10"])
+        if mask.any():
+            return gdf[mask].copy(), "district"
+
     return gdf.iloc[0:0].copy(), None
+
+
+# ── Survey geometry imputation ───────────────────────────────────────────────
+def _parse_abstract_num(s: str):
+    """Extract the integer abstract number from a surface_abstract field.
+    Returns None for '0' (not a valid abstract key) or unparseable values.
+    """
+    if not isinstance(s, str):
+        return None
+    m = re.search(r"\d+", s.strip())
+    if not m:
+        return None
+    n = int(m.group())
+    return str(n) if n > 0 else None
+
+
+def _reconstruct_survey(surf_block: str, surf_survey: str) -> str:
+    """Reconstruct the full survey / grantor name from the two split fields.
+
+    The daf420 fixed-width layout writes the block designation in chars
+    254–263 (10 chars) and the survey name in chars 264–318 (55 chars).
+    For T&P-type blocks the tier ('T2N') fills the start of the block field
+    and the survey name bleeds in:
+        surface_block  = 'T2N    T&'
+        surface_survey = 'P RR CO / DUNN, L O   64'
+        → reconstructed: 'T&P RR CO'
+    """
+    b = str(surf_block  or "").strip()
+    s = str(surf_survey or "").strip()
+    # Text after the first whitespace-delimited token = start of survey name
+    m = re.search(r"\S+\s+(.*)", b)
+    prefix = m.group(1).strip() if m else ""
+    # Strip secondary-operator suffix ("/ DUNN, L O") and trailing section refs
+    s_clean = re.sub(r"\s*/.*$", "", s)        # drop "/ secondary name"
+    s_clean = re.sub(r"\s+\d+\s*$", "", s_clean).strip()  # drop trailing number
+    return (prefix + s_clean).strip()
+
+
+def _block_tier(surf_block: str) -> str:
+    """Extract the tier code (e.g. 'T2N', 'T1N') from surface_block."""
+    m = re.match(r"^(\S+)", str(surf_block or "").strip())
+    return m.group(1) if m else ""
+
+
+def impute_survey_geometry(
+    permits_gdf: gpd.GeoDataFrame,
+    abstract_gdf,
+    block_gdf,
+    survey_gdf,
+) -> gpd.GeoDataFrame:
+    """Impute approximate geometry for approved_unspud permits lacking RT-14 coords.
+
+    Three-tier fallback:
+      1. Abstract centroid  (~0.5 mi) — joins on ABSTRACT_L = 'A-{num}'
+      2. Block-tier centroid (~2-5 mi) — groups blocks by (survey, tier),
+                                          e.g. all 'T2N' blocks of 'T&P RR CO'
+      3. Survey centroid    (~5-15 mi) — centroid of the matched survey polygon
+
+    Adds / updates:
+      geometry_source  'exact' | 'abstract_centroid' | 'block_centroid' |
+                       'survey_centroid' | None
+    """
+    out = permits_gdf.copy()
+
+    if "geometry_source" not in out.columns:
+        out["geometry_source"] = None
+
+    # Mark permits that already have valid geometry as exact
+    exact_mask = out.geometry.notna() & ~out.geometry.is_empty
+    out.loc[exact_mask, "geometry_source"] = "exact"
+
+    needs_geom = ~exact_mask
+    if not needs_geom.any():
+        return out
+
+    # ── Pre-build centroid lookups ────────────────────────────────────────────
+
+    # Abstract: key = abstract number string e.g. '4' → centroid Point
+    abs_map = {}
+    if abstract_gdf is not None and len(abstract_gdf) > 0:
+        for _, row in abstract_gdf.iterrows():
+            label = str(row.get("ABSTRACT_L", "") or "")
+            m = re.match(r"A-(\d+)$", label.strip())
+            if m:
+                abs_map[m.group(1)] = row.geometry.centroid
+
+    # Block: key = (tier e.g. 'T2N', survey fragment e.g. 'T&P') → centroid
+    # We union all matching block polygons and take the centroid of the union
+    # so we represent the whole tier band, not just one block.
+    block_tier_map = {}   # (tier, survey_key) → [Polygon, ...]
+    if block_gdf is not None and len(block_gdf) > 0:
+        for _, row in block_gdf.iterrows():
+            blo = str(row.get("LEVEL2_BLO", "") or "")
+            sur = str(row.get("LEVEL1_SUR", "") or "")
+            tier_m = re.search(r"(T\d+[NS])", blo)
+            if not tier_m:
+                continue
+            tier = tier_m.group(1)
+            # Use first 3+ char token of survey name as a loose key
+            sur_key = next(
+                (w for w in sur.split() if len(w) >= 3
+                 and w.upper() not in ("THE", "AND", "FOR")),
+                ""
+            )
+            key = (tier, sur_key.upper())
+            block_tier_map.setdefault(key, []).append(row.geometry)
+    # Compute union centroids once
+    block_tier_centroids = {
+        k: unary_union(polys).centroid
+        for k, polys in block_tier_map.items()
+        if polys
+    }
+
+    # Survey: key = LEVEL1_SUR string → centroid Point
+    survey_map = {}
+    if survey_gdf is not None and len(survey_gdf) > 0:
+        for _, row in survey_gdf.iterrows():
+            sur = str(row.get("LEVEL1_SUR", "") or "").strip()
+            if sur:
+                survey_map[sur] = row.geometry.centroid
+
+    # ── Apply imputation ──────────────────────────────────────────────────────
+    n_abstract = n_block = n_survey = 0
+
+    for idx in out.index[needs_geom]:
+        row      = out.loc[idx]
+        surf_abs = str(row.get("surface_abstract", "") or "")
+        surf_blk = str(row.get("surface_block",    "") or "")
+        surf_sur = str(row.get("surface_survey",   "") or "")
+
+        # Tier 1: abstract centroid
+        abs_num = _parse_abstract_num(surf_abs)
+        if abs_num and abs_num in abs_map:
+            out.at[idx, "geometry"] = abs_map[abs_num]
+            out.at[idx, "geometry_source"] = "abstract_centroid"
+            n_abstract += 1
+            continue
+
+        # Tier 2: block-tier centroid
+        tier = _block_tier(surf_blk)
+        full_survey = _reconstruct_survey(surf_blk, surf_sur)
+        if tier:
+            # Build a loose key from the first meaningful token of survey name
+            survey_key = next(
+                (w for w in full_survey.split() if len(w) >= 3
+                 and w.upper() not in ("THE", "AND", "FOR")),
+                ""
+            ).upper()
+            match_key = (tier, survey_key)
+            if match_key in block_tier_centroids:
+                out.at[idx, "geometry"] = block_tier_centroids[match_key]
+                out.at[idx, "geometry_source"] = "block_centroid"
+                n_block += 1
+                continue
+            # Looser: any block group matching the tier (ignoring survey)
+            tier_only = [
+                c for (t, _), c in block_tier_centroids.items() if t == tier
+            ]
+            if tier_only:
+                out.at[idx, "geometry"] = unary_union(tier_only).centroid
+                out.at[idx, "geometry_source"] = "block_centroid"
+                n_block += 1
+                continue
+
+        # Tier 3: survey centroid
+        if full_survey and full_survey in survey_map:
+            out.at[idx, "geometry"] = survey_map[full_survey]
+            out.at[idx, "geometry_source"] = "survey_centroid"
+            n_survey += 1
+            continue
+        # Tier 3 fuzzy: first meaningful token match
+        if full_survey:
+            token = next(
+                (w for w in full_survey.split() if len(w) >= 3
+                 and w.upper() not in ("THE", "AND", "FOR")),
+                ""
+            )
+            if token:
+                matches = [
+                    c for k, c in survey_map.items()
+                    if token.upper() in k.upper()
+                ]
+                if matches:
+                    out.at[idx, "geometry"] = unary_union(matches).centroid
+                    out.at[idx, "geometry_source"] = "survey_centroid"
+                    n_survey += 1
+                    continue
+
+    total_imputed = n_abstract + n_block + n_survey
+    if total_imputed > 0:
+        print(f"  Imputed {total_imputed:,} permit geometries from survey description:")
+        if n_abstract: print(f"    abstract_centroid : {n_abstract:>3}")
+        if n_block:    print(f"    block_centroid    : {n_block:>3}")
+        if n_survey:   print(f"    survey_centroid   : {n_survey:>3}")
+
+    return gpd.GeoDataFrame(out, geometry="geometry", crs=permits_gdf.crs)
 
 
 # ── Step 1: signal classification ────────────────────────────────────────────
@@ -594,6 +859,23 @@ def main():
     enriched = add_pipeline_proximity(combined, pipelines_gdf)
     enriched = add_well_density(enriched, wells_gdf)
 
+    # ── Survey geometry imputation ────────────────────────────────────────────
+    # For approved_unspud and pending_approval permits that lack RT-14 surface
+    # location records, impute an approximate location from the legal
+    # description (abstract number, block tier, survey name).
+    abstract_path_s = processed / "martinSurvey_lyr_abstract.parquet"
+    block_path_s    = processed / "martinSurvey_lyr_block.parquet"
+    survey_path_s   = processed / "martinSurvey_lyr_survey.parquet"
+    abstract_s = gpd.read_parquet(abstract_path_s) if abstract_path_s.exists() else None
+    block_s    = gpd.read_parquet(block_path_s)    if block_path_s.exists()    else None
+    survey_s   = gpd.read_parquet(survey_path_s)   if survey_path_s.exists()   else None
+
+    if any(x is not None for x in [abstract_s, block_s, survey_s]):
+        enriched = impute_survey_geometry(enriched, abstract_s, block_s, survey_s)
+
+    geom_after = enriched.geometry.notna().sum()
+    print(f"  Permits with geometry after imputation: {geom_after:,}/{len(enriched):,}")
+
     if "pipeline_proximity_class" in enriched.columns:
         prox_dist = enriched["pipeline_proximity_class"].value_counts().to_dict()
         if prox_dist:
@@ -633,6 +915,7 @@ def main():
     out_hex      = processed / "martinSignals_hexgrid.parquet"
     out_ops      = processed / "martinSignals_operators.parquet"
 
+    enriched = _coerce_mixed_objects(enriched)
     enriched.to_parquet(out_permits)
     print(f"  → {out_permits}  ({len(enriched):,} rows)")
 

@@ -79,26 +79,26 @@ def strip_field(record: str, start: int, length: int) -> str:
 def parse_date(raw: str) -> str | None:
     """Convert RRC date field → ISO 8601 string, or None if blank/zeros.
 
-    The daf420 master file uses two date formats across different record
-    generations and fields:
+    The daf420 master file encodes dates in two formats depending on record
+    vintage:
 
-    CCYYMMDD  (expected) — 4-digit year, then 2-digit month and day.
-                           e.g. '20260528' → '2026-05-28'
+    CCYYMMDD  (historical) — 4-digit century-year + 2-digit month + 2-digit
+                              day. e.g. '20260528' → '2026-05-28'.
 
-    YYMMDD??  (actual, newer records) — 2-digit year, 2-digit month,
-                           2-digit day, then 2 trailing padding chars
-                           (always '00'). parse_permits.py previously
-                           mis-sliced these as CCYYMMDD, producing
-                           corrupt strings like '2605-28-00'.
-                           e.g. '26052800' → '2026-05-28'
+    YYMMDD??  (newer records) — 2-digit year + 2-digit month + 2-digit day
+                              + 2 trailing padding chars (observed as '00'
+                              or the last two digits of the day/month from
+                              an adjacent field). e.g. '26052800' → '2026-05-28',
+                              '14060120' → '2014-06-01'.
 
     Strategy:
-      1. Try CCYYMMDD: validate month [1-12] and day [1-31].
-         Valid → return immediately.
-      2. Fallback YYMMDD??: re-slice, validate month and day.
-         Valid → prepend century using Y2K window (YY > 50 → 19xx,
-         YY <= 50 → 20xx) and return.
-      3. Neither valid → return None (bad data).
+      1. Try CCYYMMDD: require year in [1900, 2035], month in [1-12],
+         day in [1-31]. The year range is the critical guard — it rejects
+         impossible values like 1406 or 2504 that arise from mis-reading
+         YYMMDD?? data as CCYYMMDD.
+      2. Fallback YYMMDD??: re-slice as 2+2+2+2, validate month and day,
+         apply Y2K window (YY > 50 → 19xx, YY ≤ 50 → 20xx).
+      3. Neither valid → None (unrecoverable bad data).
     """
     raw = raw.strip()
     if not raw or raw == "0" * len(raw):
@@ -109,13 +109,15 @@ def parse_date(raw: str) -> str | None:
     # ── Try CCYYMMDD first ────────────────────────────────────────────────
     y4, mm, dd = raw[0:4], raw[4:6], raw[6:8]
     try:
-        if 1 <= int(mm) <= 12 and 1 <= int(dd) <= 31:
+        year, month, day = int(y4), int(mm), int(dd)
+        if 1900 <= year <= 2035 and 1 <= month <= 12 and 1 <= day <= 31:
             return f"{y4}-{mm}-{dd}"
     except ValueError:
         pass
 
     # ── Fallback: YYMMDD?? ────────────────────────────────────────────────
     yy, mm2, dd2 = raw[0:2], raw[2:4], raw[4:6]
+    # trailing = raw[6:8] — ignored (padding / junk)
     try:
         y2, month2, day2 = int(yy), int(mm2), int(dd2)
         if 1 <= month2 <= 12 and 1 <= day2 <= 31:

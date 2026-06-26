@@ -18,7 +18,6 @@ Coordinates are NAD27; reprojection to WGS 84 is done by ogr2ogr.
 """
 
 import argparse
-import csv
 import glob
 import json
 import sys
@@ -57,15 +56,32 @@ def resolve_file(raw_dir: Path, pattern: str) -> Path | None:
 
 
 def read_delimited(path: Path, expected_min_cols: int) -> list[list]:
-    """Read a }-delimited, "-quoted file, skipping the header row."""
+    """Read a }-delimited RRC file, stripping embedded double-quotes.
+
+    The RRC now wraps every field value in double-quotes (e.g. '"317"', '"Y"',
+    '"SURFACE"'). csv.reader with quotechar='"' does NOT strip these correctly
+    because many values have a leading space before the opening quote, which
+    prevents csv from recognising them as quoted fields. Instead we split each
+    line on '}' and manually strip whitespace and surrounding double-quotes.
+
+    The permit file also has a two-line header — the column name
+    CASES_EXCEP_APPROVAL_CODE is split by a bare newline as CASES_EXCEP_A /
+    PPROVAL_CODE. The second header fragment (6 fields) and any blank separator
+    lines are silently dropped by the expected_min_cols guard.
+    """
     rows = []
     with open(path, "r", encoding="latin-1") as fh:
-        reader = csv.reader(fh, delimiter="}", quotechar='"')
         header_skipped = False
-        for row in reader:
+        for line in fh:
+            parts = line.rstrip("\r\n").split("}")
+            # Strip whitespace and surrounding double-quotes from every field
+            row = [p.strip().strip('"') for p in parts]
+            # Remove the trailing empty element produced by a trailing }
+            while row and row[-1] == "":
+                row.pop()
             if not header_skipped:
                 header_skipped = True
-                continue                       # skip header row
+                continue
             if len(row) < expected_min_cols:
                 continue
             rows.append(row)
@@ -73,11 +89,14 @@ def read_delimited(path: Path, expected_min_cols: int) -> list[list]:
 
 
 def clean(val: str) -> str:
-    return val.strip() if val else ""
+    # Strip whitespace and surrounding double-quotes.
+    # read_delimited already strips quotes, but this handles any values
+    # that arrive via other paths or future format changes.
+    return val.strip().strip('"') if val else ""
 
 
 def safe_float(val: str):
-    val = clean(val)
+    val = val.strip().strip('"') if val else ""
     if not val:
         return None
     try:
@@ -176,17 +195,39 @@ def extract_permit(row: list) -> dict:
 
 
 def extract_wellbore(row: list) -> dict:
+    """Extract wellbore attributes including embedded surface coordinates.
+
+    The wellbore file contains lat/lon columns directly:
+      LAT_DEGREES_S  (index 10) / LONG_DEGREES_S (index 13) — surface location
+      LAT_DEGREES    (index  1) / LONG_DEGREES   (index  4) — fallback
+
+    These are decimal degrees (despite the DMS column name). We extract them
+    here so the main join loop can use them as a fallback when the separate
+    latlong file's API_SEQUENCE_NUMBER join fails (e.g. when the wellbore and
+    latlong files were published on different days and don't overlap).
+    """
+    def _get(i): return row[i] if len(row) > i else ""
+
+    # Prefer the explicit surface-suffixed columns; fall back to primary
+    lat = safe_float(_get(10)) or safe_float(_get(1))
+    lon = safe_float(_get(13)) or safe_float(_get(4))
+    if lon is not None and lon > 0:
+        lon = -lon  # Texas is western hemisphere — negate if stored unsigned
+
     return {
-        "wb_api_sequence_number":   clean(row[16]),
-        "wb_nearest_town_distance": safe_float(row[19]),
-        "wb_nearest_town":          clean(row[20]),
-        "wb_county_code":           clean(row[24]),
-        "wb_surface_location_code": clean(row[25]),
-        "wb_wellbore_id":           clean(row[26]),
-        "wb_universal_doc_no":      clean(row[28]),
-        "wb_operator_name":         clean(row[35]) if len(row) > 35 else "",
-        "wb_operator_number":       clean(row[36]) if len(row) > 36 else "",
-        "wb_district":              clean(row[38]) if len(row) > 38 else "",
+        "wb_api_sequence_number":   clean(_get(16)),
+        "wb_nearest_town_distance": safe_float(_get(19)),
+        "wb_nearest_town":          clean(_get(20)),
+        "wb_county_code":           clean(_get(24)),
+        "wb_surface_location_code": clean(_get(25)),
+        "wb_wellbore_id":           clean(_get(26)),
+        "wb_universal_doc_no":      clean(_get(28)),
+        "wb_operator_name":         clean(_get(35)),
+        "wb_operator_number":       clean(_get(36)),
+        "wb_district":              clean(_get(38)),
+        # Embedded surface coordinates — used as fallback when latlong join fails
+        "wb_surf_latitude":         lat,
+        "wb_surf_longitude":        lon,
     }
 
 
@@ -225,7 +266,7 @@ def main():
 
     # ── Read files ───────────────────────────────────────────────────────
     print("  Reading permit file ...")
-    permit_rows = read_delimited(permit_file, 52)
+    permit_rows = read_delimited(permit_file, 47)  # 47 = verified min from split header
     print(f"    {len(permit_rows):,} rows")
 
     print("  Reading wellbore file ...")
@@ -268,7 +309,9 @@ def main():
 
     # ── Join and build features ──────────────────────────────────────────
     features = []
-    with_geom = 0
+    with_geom    = 0
+    geom_src_ll  = 0   # from latlong file join
+    geom_src_wb  = 0   # from wellbore embedded coordinates (fallback)
 
     for row in permit_rows:
         props = extract_permit(row)
@@ -281,8 +324,21 @@ def main():
         ll  = ll_by_api.get(api, {})
         props.update(ll)
 
+        # Primary: coordinates from the latlong file (explicitly labelled SURFACE)
         lon = ll.get("surf_longitude")
         lat = ll.get("surf_latitude")
+
+        # Fallback: coordinates embedded in the wellbore file itself.
+        # Used when the latlong file and wellbore file were published on
+        # different days and their API_SEQUENCE_NUMBERs don't overlap.
+        if lon is None or lat is None:
+            lon = wb.get("wb_surf_longitude")
+            lat = wb.get("wb_surf_latitude")
+            if lon is not None and lat is not None:
+                geom_src_wb += 1
+        else:
+            geom_src_ll += 1
+
         geometry = None
         if lon is not None and lat is not None:
             geometry = {"type": "Point", "coordinates": [lon, lat]}
@@ -313,6 +369,8 @@ def main():
     without_geom = len(features) - with_geom
     print(f"  Features emitted    : {len(features):,}")
     print(f"    with geometry     : {with_geom:,}")
+    print(f"      from latlong    : {geom_src_ll:,}  (latlong file join)")
+    print(f"      from wellbore   : {geom_src_wb:,}  (wellbore embedded coords)")
     print(f"    without geometry  : {without_geom:,}")
     print(f"  Saved to '{output_path}'")
 
