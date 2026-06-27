@@ -110,6 +110,7 @@ echo ""
 echo "[1/9] permits_signals (points)"
 build_layer "permits_signals" "${PROCESSED_DIR}/martinSignals_permits.parquet" 6 14 \
     --drop-densest-as-needed \
+    --order-descending-by=signal_priority \
     --extend-zooms-if-still-dropping
 
 echo ""

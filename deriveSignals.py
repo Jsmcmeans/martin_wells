@@ -883,6 +883,23 @@ def main():
             for k, v in prox_dist.items():
                 print(f"    {str(k):<10} {v:>5,}")
 
+    # ── Signal priority — controls tippecanoe drop order at low zoom ────────────
+    # When tippecanoe thins features at low zoom, it drops from the bottom of
+    # the sort. By ordering descending on signal_priority, historical permits
+    # (priority 1) are dropped first and pending/approved (priority 4-5) always
+    # survive to the lowest zoom tile. This ensures every signal class is
+    # visible county-wide even when zoomed out.
+    SIGNAL_PRIORITY = {
+        "pending_approval":      5,
+        "approved_unspud":       4,
+        "recently_drilled":      3,
+        "drilled_no_completion": 2,
+        "historical":            1,
+    }
+    enriched["signal_priority"] = (
+        enriched["signal_class"].map(SIGNAL_PRIORITY).fillna(0).astype(int)
+    )
+
     # ── Hexgrid ──────────────────────────────────────────────────────────────
     print(f"\n[5/7] Building H3 hexgrid (resolution {H3_RESOLUTION})")
     hexgrid = build_hexgrid(enriched)
