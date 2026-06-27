@@ -951,6 +951,42 @@ def main():
     write_operators_json(web, operators)
     print(f"  → {web / 'operators.json'}")
 
+    # Signal class cluster centroids for low-zoom map display.
+    # Groups permits by signal_class + rounded coordinate (1 km precision) so
+    # stacked imputed centroids collapse to a single dot per cluster.
+    # Excludes historical — too many, not the point of the low-zoom view.
+    # Output: one GeoJSON feature per signal class per geographic cluster,
+    # colored by class and labeled with count.
+    non_hist = enriched[
+        enriched.geometry.notna()
+        & ~enriched.geometry.is_empty
+        & (enriched["signal_class"] != "historical")
+    ].copy()
+    non_hist["_lat_r"] = non_hist.geometry.y.round(2)
+    non_hist["_lon_r"] = non_hist.geometry.x.round(2)
+
+    centroid_features = []
+    for (cls, lat_r, lon_r), grp in non_hist.groupby(
+        ["signal_class", "_lat_r", "_lon_r"], sort=False
+    ):
+        cluster_centroid = unary_union(grp.geometry.values).centroid
+        centroid_features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [round(cluster_centroid.x, 4), round(cluster_centroid.y, 4)],
+            },
+            "properties": {
+                "signal_class": cls,
+                "count": len(grp),
+            },
+        })
+
+    centroids_path = web / "signal_centroids.json"
+    with open(centroids_path, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": centroid_features}, f)
+    print(f"  → {centroids_path}  ({len(centroid_features)} cluster dots)")
+
     # Bounding box from enriched permits + wells
     bbox_layers = [enriched, wells_enriched]
     bbox = None
