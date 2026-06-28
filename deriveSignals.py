@@ -576,6 +576,31 @@ def build_hexgrid(permits_gdf):
         if c.startswith("count_") or c in ("permit_count", "operator_count"):
             merged[c] = merged[c].astype(int)
 
+    # ── Recency-weighted activity score ───────────────────────────────────────
+    # The hexgrid fill encodes a single quantitative measure (sequential color
+    # ramp) per cartographic best practice — NOT categorical signal class, which
+    # is already handled by the cluster dots and individual permit dots.
+    #
+    # Fresh activity (pending, approved-unspud, recently-drilled) is weighted 3x;
+    # settled-but-still-recent activity (drilled-no-completion, historical —
+    # all permits in this dataset are from the last ~12 months) is weighted 1x.
+    # This makes hexes with new capital deployment glow brightest while still
+    # showing where any permitting has occurred over the trailing year.
+    def _col(name):
+        return merged[name] if name in merged.columns else 0
+
+    fresh = (
+        _col("count_pending_approval")
+        + _col("count_approved_unspud")
+        + _col("count_recently_drilled")
+    )
+    settled = (
+        _col("count_drilled_no_completion")
+        + _col("count_historical")
+    )
+    merged["activity_score"] = (3 * fresh + 1 * settled).astype(int)
+    merged["fresh_count"] = fresh.astype(int) if hasattr(fresh, "astype") else int(fresh)
+
     # Build hex polygons. h3 v4 cell_to_boundary returns ((lat, lng), …).
     def cell_to_polygon(cell_id):
         boundary = H3_BOUNDARY_FOR(cell_id)
@@ -904,6 +929,11 @@ def main():
     print(f"\n[5/7] Building H3 hexgrid (resolution {H3_RESOLUTION})")
     hexgrid = build_hexgrid(enriched)
     print(f"  {len(hexgrid):,} hexes with at least one permit")
+    if len(hexgrid) > 0 and "activity_score" in hexgrid.columns:
+        scores = hexgrid["activity_score"]
+        qs = scores.quantile([0.2, 0.4, 0.6, 0.8, 1.0]).astype(int).tolist()
+        print(f"  Activity score range: {int(scores.min())}–{int(scores.max())}  "
+              f"(quintile breaks: {qs})")
 
     # ── Production trend → wells ─────────────────────────────────────────────
     print("\n[6/7] Computing production trend & enriching wells")
