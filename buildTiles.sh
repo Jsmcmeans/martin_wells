@@ -25,7 +25,7 @@ TILES_DIR="data/tiles"
 TMP_DIR="data/tmp/geojsonl"
 
 # ── Step 0: Sanity checks ─────────────────────────────────────────────────────
-echo "[0/9] Verifying toolchain"
+echo "[0/10] Verifying toolchain"
 command -v ogr2ogr >/dev/null 2>&1 || {
     echo "  ERROR: ogr2ogr (GDAL) not on PATH" >&2; exit 1; }
 command -v tippecanoe >/dev/null 2>&1 || {
@@ -125,32 +125,36 @@ build_layer "pipelines" "${PROCESSED_DIR}/martinPipelines.parquet" 6 14 \
     --simplification=10
 
 echo ""
-echo "[4/9] hexgrid (polygons — heatmap)"
+echo "[4/10] hexgrid (polygons — permit activity)"
 build_layer "hexgrid" "${PROCESSED_DIR}/martinSignals_hexgrid.parquet" 5 12
 
 echo ""
-echo "[5/9] survey_block (polygons — reference)"
+echo "[5/10] hexgrid_production (polygons — BOE magnitude)"
+build_layer "hexgrid_production" "${PROCESSED_DIR}/martinSignals_hexgrid_production.parquet" 5 12
+
+echo ""
+echo "[6/10] survey_block (polygons — reference)"
 build_layer "survey_block" "${PROCESSED_DIR}/martinSurvey_lyr_block.parquet" 8 14 \
     --coalesce-densest-as-needed
 
 echo ""
-echo "[6/9] survey_section (polygons — reference)"
+echo "[7/10] survey_section (polygons — reference)"
 build_layer "survey_section" "${PROCESSED_DIR}/martinSurvey_lyr_section.parquet" 8 14 \
     --coalesce-densest-as-needed
 
 echo ""
-echo "[7/9] survey_abstract (polygons — reference, high zoom only)"
+echo "[8/10] survey_abstract (polygons — reference, high zoom only)"
 build_layer "survey_abstract" "${PROCESSED_DIR}/martinSurvey_lyr_abstract.parquet" 11 14 \
     --coalesce-densest-as-needed
 
 echo ""
-echo "[8/9] parcels (polygons — reference, high zoom only)"
+echo "[9/10] parcels (polygons — reference, high zoom only)"
 build_layer "parcels" "${PROCESSED_DIR}/martinParcels.parquet" 12 14 \
     --coalesce-densest-as-needed
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 echo ""
-echo "[9/9] Cleanup"
+echo "[10/10] Cleanup"
 rm -rf "$TMP_DIR"
 echo "  Removed intermediate GeoJSONL files"
 

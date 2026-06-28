@@ -669,11 +669,58 @@ def compute_lease_trend(leases_df):
     return trend
 
 
-def enrich_wells_with_trend(wells_gdf, prod_wells_df, lease_trend_df):
-    """Join lease-level trend onto wells via the prod_wells (api_number) bridge."""
+def build_lease_descriptors(leases_df):
+    """One row per lease key with descriptive names (operator, lease, field).
+
+    The lease-cycle table repeats these per month; we take the most recent
+    non-blank value per lease so the well popup can show who operates it and
+    what field it's in. Returns a DataFrame keyed by oil_gas_code+district_no+lease_no.
+    """
+    keys = ["oil_gas_code", "district_no", "lease_no"]
+    if leases_df is None or len(leases_df) == 0:
+        return pd.DataFrame(columns=keys + ["lease_name", "operator_name", "field_name"])
+
+    df = leases_df.copy()
+    # Sort so the most recent cycle is last, then keep last non-null per key
+    if "cycle_year_month" in df.columns:
+        df = df.sort_values("cycle_year_month")
+
+    desc_cols = [c for c in ["lease_name", "operator_name", "field_name"] if c in df.columns]
+    if not desc_cols:
+        return pd.DataFrame(columns=keys + ["lease_name", "operator_name", "field_name"])
+
+    # Replace blanks with NaN so "last valid" skips them
+    for c in desc_cols:
+        df[c] = df[c].replace("", np.nan)
+
+    agg = df.groupby(keys)[desc_cols].agg("last").reset_index()
+    return agg
+
+
+def enrich_wells_with_trend(wells_gdf, prod_wells_df, lease_trend_df, lease_desc_df=None):
+    """Join lease-level production data onto wells via the prod_wells bridge.
+
+    Adds both the trend classification AND descriptive attributes so the well
+    popup is informative. The well shapefile (well317s) is geometry-only —
+    operator, lease, field, status, and BOE all come from the production tables
+    joined here on api_number.
+
+    Columns added:
+        prod_trend_class, prod_trend_pct        (trajectory)
+        boe_recent_12mo, boe_prior_12mo         (magnitude)
+        prod_operator_name, prod_lease_name     (descriptive — from leases table)
+        prod_field_name                         (descriptive — from leases table)
+        well_14b2_status                        (descriptive — from wells table)
+    """
     out = wells_gdf.copy()
     out["prod_trend_class"] = "unknown"
     out["prod_trend_pct"] = np.nan
+    out["boe_recent_12mo"] = np.nan
+    out["boe_prior_12mo"] = np.nan
+    out["prod_operator_name"] = None
+    out["prod_lease_name"] = None
+    out["prod_field_name"] = None
+    out["well_14b2_status"] = None
 
     if prod_wells_df is None or lease_trend_df is None or len(lease_trend_df) == 0:
         return out
@@ -688,16 +735,123 @@ def enrich_wells_with_trend(wells_gdf, prod_wells_df, lease_trend_df):
     out["api_number"] = _normalize_api(out[api_col])
 
     keys = ["oil_gas_code", "district_no", "lease_no"]
-    bridge = (prod_wells_df.merge(lease_trend_df, on=keys, how="left")
-              [["api_number", "prod_trend_class", "prod_trend_pct"]]
+
+    # Start from prod_wells (carries api_number + 14B2 status + lease keys),
+    # join the per-lease trend (BOE magnitude + trajectory),
+    # then join the per-lease descriptors (operator/lease/field names).
+    merged_bridge = prod_wells_df.merge(lease_trend_df, on=keys, how="left")
+    if lease_desc_df is not None and len(lease_desc_df) > 0:
+        merged_bridge = merged_bridge.merge(lease_desc_df, on=keys, how="left")
+
+    bridge_cols = ["api_number", "prod_trend_class", "prod_trend_pct",
+                   "boe_recent_12mo", "boe_prior_12mo"]
+
+    rename_map = {
+        "operator_name":         "prod_operator_name",
+        "lease_name":            "prod_lease_name",
+        "field_name":            "prod_field_name",
+        "well_14b2_status_code": "well_14b2_status",
+    }
+    for src, dst in rename_map.items():
+        if src in merged_bridge.columns:
+            merged_bridge[dst] = merged_bridge[src]
+            bridge_cols.append(dst)
+
+    bridge = (merged_bridge[bridge_cols]
               .dropna(subset=["api_number"])
               .drop_duplicates("api_number"))
 
-    out = out.drop(columns=["prod_trend_class", "prod_trend_pct"]).merge(
-        bridge, on="api_number", how="left"
-    )
+    drop_existing = [c for c in bridge.columns if c != "api_number" and c in out.columns]
+    out = out.drop(columns=drop_existing).merge(bridge, on="api_number", how="left")
     out["prod_trend_class"] = out["prod_trend_class"].fillna("unknown")
     return out
+
+
+def build_production_hexgrid(wells_enriched):
+    """Bin production-enriched wells into H3 hexes — BOE magnitude + trend.
+
+    This is a SEPARATE layer from the permit hexgrid. Where the permit hexgrid
+    answers "where is new capital being committed?", this answers "where is
+    production actually coming from, and is it growing or declining?"
+
+    Per-hex measures:
+        boe_recent_12mo   sum of recent-12-month BOE across wells in the hex
+        boe_prior_12mo    sum of prior-12-month BOE (for trajectory context)
+        well_count        number of producing wells in the hex
+        prod_trend_majority  majority-vote trend among wells (growing/declining/…)
+        boe_score         log-scaled 0–100 magnitude for the choropleth ramp
+
+    The fill encodes boe_score (magnitude). Trajectory lives in the popup.
+    """
+    empty_cols = ["h3_id", "well_count", "boe_recent_12mo", "boe_prior_12mo",
+                  "prod_trend_majority", "boe_score", "geometry"]
+    if wells_enriched is None or len(wells_enriched) == 0:
+        return gpd.GeoDataFrame(columns=empty_cols, geometry="geometry", crs=WGS84)
+
+    g = wells_enriched[
+        wells_enriched.geometry.notna() & ~wells_enriched.geometry.is_empty
+    ].copy()
+
+    # Only wells that actually have production data contribute to this grid
+    if "boe_recent_12mo" in g.columns:
+        g = g[g["boe_recent_12mo"].notna() & (g["boe_recent_12mo"] > 0)].copy()
+
+    if len(g) == 0:
+        return gpd.GeoDataFrame(columns=empty_cols, geometry="geometry", crs=WGS84)
+
+    g["h3_id"] = [H3_CELL_FOR(pt.y, pt.x, H3_RESOLUTION) for pt in g.geometry]
+
+    grouped = g.groupby("h3_id")
+    agg = pd.DataFrame({
+        "well_count":      grouped.size(),
+        "boe_recent_12mo": grouped["boe_recent_12mo"].sum(),
+        "boe_prior_12mo":  grouped["boe_prior_12mo"].sum()
+                           if "boe_prior_12mo" in g.columns else 0,
+    })
+
+    # Majority-vote trend class per hex (ignore 'unknown' if real signal exists)
+    def majority_trend(s):
+        vc = s[s != "unknown"].value_counts()
+        if len(vc) > 0:
+            return vc.index[0]
+        return "unknown"
+
+    if "prod_trend_class" in g.columns:
+        agg["prod_trend_majority"] = grouped["prod_trend_class"].agg(majority_trend)
+    else:
+        agg["prod_trend_majority"] = "unknown"
+
+    # Dominant operator per hex (most producing wells)
+    if "prod_operator_name" in g.columns:
+        agg["dominant_operator"] = grouped["prod_operator_name"].agg(
+            lambda s: s.dropna().value_counts().index[0] if s.dropna().size else None
+        )
+
+    agg = agg.reset_index()
+
+    # ── Magnitude → log-scaled 0–100 score ────────────────────────────────────
+    # Production is heavily right-skewed (a few giant leases dominate), so a
+    # raw-linear ramp would make all but the top hex invisible. log1p compresses
+    # the long tail so mid-tier producers remain distinguishable.
+    boe = agg["boe_recent_12mo"].clip(lower=0)
+    log_boe = np.log1p(boe)
+    max_log = log_boe.max()
+    agg["boe_score"] = (
+        (log_boe / max_log * 100).round().astype(int) if max_log > 0 else 0
+    )
+
+    # Build hex polygons (same convention as permit hexgrid)
+    def cell_to_polygon(cell_id):
+        boundary = H3_BOUNDARY_FOR(cell_id)
+        return Polygon([(lng, lat) for lat, lng in boundary])
+
+    agg["geometry"] = agg["h3_id"].apply(cell_to_polygon)
+    agg["well_count"] = agg["well_count"].astype(int)
+    agg["boe_recent_12mo"] = agg["boe_recent_12mo"].round().astype("int64")
+    if "boe_prior_12mo" in agg.columns:
+        agg["boe_prior_12mo"] = agg["boe_prior_12mo"].round().astype("int64")
+
+    return gpd.GeoDataFrame(agg, geometry="geometry", crs=WGS84)
 
 
 # ── Step 5: operator rollup ──────────────────────────────────────────────────
@@ -940,14 +1094,33 @@ def main():
     lease_trend = compute_lease_trend(prod_leases_df)
     print(f"  {len(lease_trend):,} leases with trend computed")
 
+    lease_desc = build_lease_descriptors(prod_leases_df)
+
     if wells_gdf is not None:
-        wells_enriched = enrich_wells_with_trend(wells_gdf, prod_wells_df, lease_trend)
+        wells_enriched = enrich_wells_with_trend(
+            wells_gdf, prod_wells_df, lease_trend, lease_desc
+        )
         trend_dist = wells_enriched["prod_trend_class"].value_counts().to_dict()
         print("  Well trend distribution:")
         for k, v in trend_dist.items():
             print(f"    {k:<12} {v:>5,}")
+        n_named = wells_enriched["prod_operator_name"].notna().sum() \
+            if "prod_operator_name" in wells_enriched.columns else 0
+        print(f"  Wells with operator name: {n_named:,}")
     else:
         wells_enriched = gpd.GeoDataFrame(geometry=[], crs=WGS84)
+
+    # ── Production hexgrid (separate layer — BOE magnitude + trend) ───────────
+    print("  Building production hexgrid (BOE magnitude + trajectory)")
+    prod_hexgrid = build_production_hexgrid(wells_enriched)
+    if len(prod_hexgrid) > 0:
+        bsc = prod_hexgrid["boe_score"]
+        print(f"  {len(prod_hexgrid):,} production hexes  "
+              f"|  BOE score range {int(bsc.min())}–{int(bsc.max())}")
+        tmaj = prod_hexgrid["prod_trend_majority"].value_counts().to_dict()
+        print(f"  Hex trend majority: {tmaj}")
+    else:
+        print("  No production hexes (no wells with BOE data)")
 
     # ── Operator rollup ──────────────────────────────────────────────────────
     print("\n[7/7] Operator rollup")
@@ -960,6 +1133,7 @@ def main():
     out_permits  = processed / "martinSignals_permits.parquet"
     out_wells    = processed / "martinSignals_wells.parquet"
     out_hex      = processed / "martinSignals_hexgrid.parquet"
+    out_prod_hex = processed / "martinSignals_hexgrid_production.parquet"
     out_ops      = processed / "martinSignals_operators.parquet"
 
     enriched = _coerce_mixed_objects(enriched)
@@ -973,6 +1147,10 @@ def main():
     if len(hexgrid) > 0:
         hexgrid.to_parquet(out_hex)
         print(f"  → {out_hex}  ({len(hexgrid):,} rows)")
+
+    if len(prod_hexgrid) > 0:
+        prod_hexgrid.to_parquet(out_prod_hex)
+        print(f"  → {out_prod_hex}  ({len(prod_hexgrid):,} rows)")
 
     operators.to_parquet(out_ops)
     print(f"  → {out_ops}  ({len(operators):,} rows)")
